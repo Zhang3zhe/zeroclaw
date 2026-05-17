@@ -1168,14 +1168,39 @@ impl Channel for QQChannel {
             Close(Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>),
             StreamEnded,
             HeartbeatTimeout,
+            StallWatchdog,
             WriteFailed,
             ChannelClosed,
         }
 
         let exit_reason;
 
+        // Stall watchdog: backup safety net for the half-open TCP scenario where
+        // the heartbeat send path appears alive but no data is ever received.
+        // Threshold is 2 heartbeat cycles (2 × ~41s) plus margin = 90s.
+        let qq_watchdog = zeroclaw_infra::stall_watchdog::StallWatchdog::new(90);
+        let (qq_stall_tx, mut qq_stall_rx) = tokio::sync::mpsc::channel::<()>(1);
+        {
+            let signal = qq_stall_tx.clone();
+            qq_watchdog
+                .start(move || {
+                    tracing::warn!(
+                        "QQ: stall watchdog fired — no server events for 90s; \
+                         triggering reconnect"
+                    );
+                    let _ = signal.try_send(());
+                })
+                .await;
+        }
+        let _qq_stall_tx_guard = qq_stall_tx;
+
         'outer: loop {
             tokio::select! {
+                _ = qq_stall_rx.recv() => {
+                    tracing::info!("QQ: breaking event loop due to stall watchdog");
+                    exit_reason = ExitReason::StallWatchdog;
+                    break;
+                }
                 _ = hb_rx.recv() => {
                     // Increment the missed-ACK counter.  Only declare the
                     // connection dead after MAX_MISSED_ACKS consecutive
@@ -1271,6 +1296,7 @@ impl Channel for QQChannel {
                         // Heartbeat ACK
                         11 => {
                             missed_ack_count = 0;
+                            qq_watchdog.touch();
                             continue;
                         }
                         _ => {}
@@ -1280,6 +1306,9 @@ impl Channel for QQChannel {
                     if op != 0 {
                         continue;
                     }
+
+                    // Any dispatch event means the server is alive and sending data.
+                    qq_watchdog.touch();
 
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
                     let d = match event.get("d") {
@@ -1395,6 +1424,8 @@ impl Channel for QQChannel {
             }
         }
 
+        qq_watchdog.stop().await;
+
         // Persist sequence number for potential resume on next reconnect
         *self.last_sequence.write().await = if sequence >= 0 { Some(sequence) } else { None };
 
@@ -1440,6 +1471,11 @@ impl Channel for QQChannel {
                 anyhow::bail!(
                     "QQ WebSocket connection closed: heartbeat ACK timeout \
                      ({MAX_MISSED_ACKS} consecutive missed ACKs)"
+                )
+            }
+            ExitReason::StallWatchdog => {
+                anyhow::bail!(
+                    "QQ WebSocket connection closed: stall watchdog (no server events for 90s)"
                 )
             }
             ExitReason::WriteFailed => {
