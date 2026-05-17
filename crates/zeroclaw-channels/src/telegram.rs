@@ -582,9 +582,13 @@ impl TelegramChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        zeroclaw_config::schema::build_channel_proxy_client(
+        // 45s total timeout (> the 30s Telegram poll timeout) ensures a hung
+        // TCP read is forcibly aborted rather than blocking forever.
+        zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
             "channel.telegram",
             self.proxy_url.as_deref(),
+            45,
+            10,
         )
     }
 
@@ -3155,7 +3159,32 @@ impl Channel for TelegramChannel {
 
         self.register_bot_commands().await;
 
+        // Stall watchdog: if no successful getUpdates response arrives for
+        // 120 seconds the TCP connection is likely broken (e.g. NAT timeout).
+        // The watchdog signals the poll loop to break so the supervisor can
+        // restart the listener with a fresh connection.
+        let watchdog = zeroclaw_infra::stall_watchdog::StallWatchdog::new(120);
+        let (stall_tx, mut stall_rx) = tokio::sync::mpsc::channel::<()>(1);
+        {
+            let signal = stall_tx.clone();
+            watchdog
+                .start(move || {
+                    tracing::warn!(
+                        "Telegram: stall watchdog fired — no server response for 120s; \
+                         triggering reconnect"
+                    );
+                    let _ = signal.try_send(());
+                })
+                .await;
+        }
+        let _stall_tx_guard = stall_tx;
+
         loop {
+            if stall_rx.try_recv().is_ok() {
+                tracing::info!("Telegram: breaking poll loop due to stall watchdog");
+                break;
+            }
+
             if self.mention_only {
                 let missing_username = self.bot_username.lock().is_none();
                 if missing_username {
@@ -3187,6 +3216,9 @@ impl Channel for TelegramChannel {
                     continue;
                 }
             };
+
+            // A successful response — connection is alive.
+            watchdog.touch();
 
             let ok = data
                 .get("ok")
@@ -3324,11 +3356,15 @@ Ensure only one `zeroclaw` process is using this bot token."
                         .await; // Ignore errors for typing indicator
 
                     if tx.send(msg).await.is_err() {
+                        watchdog.stop().await;
                         return Ok(());
                     }
                 }
             }
         }
+
+        watchdog.stop().await;
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {
